@@ -14,6 +14,7 @@ import (
 	"github.com/shirou/gopsutil/v3/disk"
 	"github.com/shirou/gopsutil/v3/load"
 	"github.com/shirou/gopsutil/v3/mem"
+	"github.com/shirou/gopsutil/v3/net"
 	"github.com/spf13/cobra"
 	"github.com/vishvananda/netlink"
 )
@@ -45,6 +46,13 @@ const (
 	netTableFocus
 )
 
+type viewMode int
+
+const (
+	dashboardView viewMode = iota
+	networkDetailView
+)
+
 type model struct {
 	cpuPercents    []float64
 	loadAvg        *load.AvgStat
@@ -54,7 +62,7 @@ type model struct {
 	diskPartitions []disk.PartitionStat
 	diskUsage      map[string]*disk.UsageStat
 	netInterfaces  []netlink.Link
-	netStats       map[string]netlink.LinkStatistics
+	netStats       map[string]net.IOCountersStat
 	width          int
 	height         int
 	lastUpdate     time.Time
@@ -63,6 +71,8 @@ type model struct {
 	memTable       table.Model
 	netTable       table.Model
 	focusedTable   focusedTable
+	currentView    viewMode
+	selectedIface  string
 }
 
 func initialModel() model {
@@ -81,16 +91,17 @@ func initialModel() model {
 
 	m := model{
 		diskUsage:      make(map[string]*disk.UsageStat),
-		netStats:       make(map[string]netlink.LinkStatistics),
+		netStats:       make(map[string]net.IOCountersStat),
 		diskStats:      make(map[string]disk.IOCountersStat),
 		lastUpdate:     time.Now(),
 		cpuPercents:    make([]float64, 0),
 		diskPartitions: make([]disk.PartitionStat, 0),
 		netInterfaces:  make([]netlink.Link, 0),
 		focusedTable:   cpuTableFocus,
+		currentView:    dashboardView,
 	}
 
-	// Initialize tables with minimal widths
+	// Initialize tables with minimal widths and no padding
 	m.diskTable = table.New(
 		table.WithColumns([]table.Column{
 			{Title: "Disk(d)", Width: 20},
@@ -128,7 +139,6 @@ func initialModel() model {
 			{Title: "Iface(i)", Width: 15},
 			{Title: "RX(r)", Width: 20},
 			{Title: "TX(t)", Width: 20},
-			{Title: "Total(s)", Width: 20},
 		}),
 		table.WithStyles(tableStyle),
 		table.WithHeight(6),
@@ -155,40 +165,58 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
+		case "esc":
+			if m.currentView == networkDetailView {
+				m.currentView = dashboardView
+				return m, nil
+			}
+		case "enter":
+			if m.focusedTable == netTableFocus && m.currentView == dashboardView {
+				selectedRow := m.netTable.SelectedRow()
+				if len(selectedRow) > 0 {
+					m.selectedIface = selectedRow[0]
+					m.currentView = networkDetailView
+					return m, nil
+				}
+			}
 		case "tab":
-			// Cycle through tables
-			m.focusedTable = (m.focusedTable + 1) % 3
-			
-			// Update table selection states
-			switch m.focusedTable {
-			case cpuTableFocus:
-				m.cpuTable.SetRows(m.cpuTable.Rows())
-				m.cpuTable.Focus()
-				m.diskTable.Blur()
-				m.netTable.Blur()
-			case diskTableFocus:
-				m.diskTable.SetRows(m.diskTable.Rows())
-				m.diskTable.Focus()
-				m.cpuTable.Blur()
-				m.netTable.Blur()
-			case netTableFocus:
-				m.netTable.SetRows(m.netTable.Rows())
-				m.netTable.Focus()
-				m.cpuTable.Blur()
-				m.diskTable.Blur()
+			if m.currentView == dashboardView {
+				// Cycle through tables
+				m.focusedTable = (m.focusedTable + 1) % 3
+				
+				// Update table selection states
+				switch m.focusedTable {
+				case cpuTableFocus:
+					m.cpuTable.SetRows(m.cpuTable.Rows())
+					m.cpuTable.Focus()
+					m.diskTable.Blur()
+					m.netTable.Blur()
+				case diskTableFocus:
+					m.diskTable.SetRows(m.diskTable.Rows())
+					m.diskTable.Focus()
+					m.cpuTable.Blur()
+					m.netTable.Blur()
+				case netTableFocus:
+					m.netTable.SetRows(m.netTable.Rows())
+					m.netTable.Focus()
+					m.cpuTable.Blur()
+					m.diskTable.Blur()
+				}
 			}
 			return m, nil
 		case "up", "down", "pageup", "pagedown", "home", "end":
-			var cmd tea.Cmd
-			switch m.focusedTable {
-			case cpuTableFocus:
-				m.cpuTable, cmd = m.cpuTable.Update(msg)
-			case diskTableFocus:
-				m.diskTable, cmd = m.diskTable.Update(msg)
-			case netTableFocus:
-				m.netTable, cmd = m.netTable.Update(msg)
+			if m.currentView == dashboardView {
+				var cmd tea.Cmd
+				switch m.focusedTable {
+				case cpuTableFocus:
+					m.cpuTable, cmd = m.cpuTable.Update(msg)
+				case diskTableFocus:
+					m.diskTable, cmd = m.diskTable.Update(msg)
+				case netTableFocus:
+					m.netTable, cmd = m.netTable.Update(msg)
+				}
+				return m, cmd
 			}
-			return m, cmd
 		}
 
 	case tea.WindowSizeMsg:
@@ -234,15 +262,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// Update network stats
-		if links, err := netlink.LinkList(); err == nil {
-			m.netInterfaces = links
-			stats := make(map[string]netlink.LinkStatistics)
-			for _, link := range links {
-				if link.Attrs().Statistics != nil {
-					stats[link.Attrs().Name] = *link.Attrs().Statistics
-				}
+		if iostats, err := net.IOCounters(false); err == nil {
+			for _, stat := range iostats {
+				m.netStats[stat.Name] = stat
 			}
-			m.netStats = stats
 		}
 
 		// Update tables
@@ -312,16 +335,12 @@ func (m *model) updateTables() {
 
 	// Update network table
 	var netRows []table.Row
-	for _, iface := range m.netInterfaces {
-		attrs := iface.Attrs()
-		if stats, ok := m.netStats[attrs.Name]; ok {
-			netRows = append(netRows, table.Row{
-				attrs.Name,
-				humanize.Bytes(uint64(stats.RxBytes)),
-				humanize.Bytes(uint64(stats.TxBytes)),
-				humanize.Bytes(uint64(stats.RxBytes + stats.TxBytes)),
-			})
-		}
+	for _, stats := range m.netStats {
+		netRows = append(netRows, table.Row{
+			stats.Name,
+			humanize.Bytes(stats.BytesRecv),
+			humanize.Bytes(stats.BytesSent),
+		})
 	}
 	m.netTable.SetRows(netRows)
 }
@@ -329,6 +348,10 @@ func (m *model) updateTables() {
 func (m model) View() string {
 	if m.width == 0 {
 		return "Loading..."
+	}
+
+	if m.currentView == networkDetailView {
+		return m.networkDetailView()
 	}
 
 	// Calculate available space for sections
@@ -339,12 +362,12 @@ func (m model) View() string {
 	style := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("#7287fd")).
-		Padding(0, 1)
+		Padding(0, 0)
 
 	if useVerticalLayout {
-		style = style.Width(availWidth - 4)
+		style = style.Width(availWidth - 2)
 	} else {
-		style = style.Width(availWidth/2 - 4)
+		style = style.Width(availWidth/2 - 2)
 	}
 
 	headerStyle := lipgloss.NewStyle().
@@ -354,7 +377,7 @@ func (m model) View() string {
 	// Create sections with nil checks
 	var cpuSection string
 	if m.loadAvg != nil {
-		cpuSection = style.Copy().Width(availWidth/3 - 4).Render(
+		cpuSection = style.Copy().Width(availWidth/3 - 2).Render(
 			lipgloss.JoinVertical(
 				lipgloss.Left,
 				headerStyle.Render(fmt.Sprintf("CPU %s", m.getFocusIndicator(cpuTableFocus))),
@@ -366,7 +389,7 @@ func (m model) View() string {
 			),
 		)
 	} else {
-		cpuSection = style.Copy().Width(availWidth/3 - 4).Render(
+		cpuSection = style.Copy().Width(availWidth/3 - 2).Render(
 			lipgloss.JoinVertical(
 				lipgloss.Left,
 				headerStyle.Render(fmt.Sprintf("CPU %s", m.getFocusIndicator(cpuTableFocus))),
@@ -376,7 +399,7 @@ func (m model) View() string {
 		)
 	}
 
-	memSection := style.Copy().Width(2*availWidth/3 - 4).Render(
+	memSection := style.Copy().Width(2*availWidth/3 - 2).Render(
 		lipgloss.JoinVertical(
 			lipgloss.Left,
 			headerStyle.Render("Memory"),
@@ -421,6 +444,43 @@ func (m model) View() string {
 		MaxWidth(m.width).
 		MaxHeight(m.height).
 		Render(finalLayout)
+}
+
+func (m model) networkDetailView() string {
+	if stats, ok := m.netStats[m.selectedIface]; ok {
+		style := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("#7287fd")).
+			Padding(1, 2).
+			Width(m.width - 4)
+
+		headerStyle := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#8caaee")).
+			Bold(true)
+
+		content := []string{
+			headerStyle.Render(fmt.Sprintf("Interface: %s", m.selectedIface)),
+			"",
+			fmt.Sprintf("RX Bytes:     %s", humanize.Bytes(stats.BytesRecv)),
+			fmt.Sprintf("RX Packets:   %d", stats.PacketsRecv),
+			fmt.Sprintf("RX Errors:    %d", stats.Errin),
+			fmt.Sprintf("RX Dropped:   %d", stats.Dropin),
+			"",
+			fmt.Sprintf("TX Bytes:     %s", humanize.Bytes(stats.BytesSent)),
+			fmt.Sprintf("TX Packets:   %d", stats.PacketsSent),
+			fmt.Sprintf("TX Errors:    %d", stats.Errout),
+			fmt.Sprintf("TX Dropped:   %d", stats.Dropout),
+			"",
+			"Press ESC to return",
+		}
+
+		return style.Render(lipgloss.JoinVertical(
+			lipgloss.Left,
+			content...,
+		))
+	}
+
+	return "Interface not found"
 }
 
 func (m model) getFocusIndicator(t focusedTable) string {
