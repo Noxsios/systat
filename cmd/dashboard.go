@@ -19,34 +19,40 @@ import (
 )
 
 var dashboardCmd = &cobra.Command{
-	Use:   "dashboard",
-	Short: "Display system metrics in an interactive dashboard",
+	Use:     "dashboard",
+	Aliases: []string{"dash"},
+	Short:   "Display system metrics in an interactive dashboard",
 	Long: `Display all system metrics in an interactive dashboard.
 Use arrow keys to navigate between sections.
 Press 'q' to quit.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		p := tea.NewProgram(initialModel())
+		p := tea.NewProgram(
+			initialModel(),
+			tea.WithAltScreen(),
+			tea.WithMouseCellMotion(),
+		)
 		_, err := p.Run()
 		return err
 	},
 }
 
 type model struct {
-	cpuPercents   []float64
-	loadAvg       *load.AvgStat
-	memory        *mem.VirtualMemoryStat
-	swap          *mem.SwapMemoryStat
-	diskStats     map[string]disk.IOCountersStat
+	cpuPercents    []float64
+	loadAvg        *load.AvgStat
+	memory         *mem.VirtualMemoryStat
+	swap           *mem.SwapMemoryStat
+	diskStats      map[string]disk.IOCountersStat
 	diskPartitions []disk.PartitionStat
-	diskUsage     map[string]*disk.UsageStat
-	netInterfaces []netlink.Link
-	netStats      map[string]netlink.LinkStatistics
-	width         int
-	lastUpdate    time.Time
-	diskTable     table.Model
-	cpuTable      table.Model
-	memTable      table.Model
-	netTable      table.Model
+	diskUsage      map[string]*disk.UsageStat
+	netInterfaces  []netlink.Link
+	netStats       map[string]netlink.LinkStatistics
+	width          int
+	height         int
+	lastUpdate     time.Time
+	diskTable      table.Model
+	cpuTable       table.Model
+	memTable       table.Model
+	netTable       table.Model
 }
 
 func initialModel() model {
@@ -59,16 +65,16 @@ func initialModel() model {
 		Bold(true)
 
 	m := model{
-		diskUsage:     make(map[string]*disk.UsageStat),
-		netStats:      make(map[string]netlink.LinkStatistics),
-		diskStats:     make(map[string]disk.IOCountersStat),
-		lastUpdate:    time.Now(),
-		cpuPercents:   make([]float64, 0),
+		diskUsage:      make(map[string]*disk.UsageStat),
+		netStats:       make(map[string]netlink.LinkStatistics),
+		diskStats:      make(map[string]disk.IOCountersStat),
+		lastUpdate:     time.Now(),
+		cpuPercents:    make([]float64, 0),
 		diskPartitions: make([]disk.PartitionStat, 0),
-		netInterfaces: make([]netlink.Link, 0),
+		netInterfaces:  make([]netlink.Link, 0),
 	}
 
-	// Initialize tables
+	// Initialize tables with minimal widths
 	m.diskTable = table.New(
 		table.WithColumns([]table.Column{
 			{Title: "Disk(d)", Width: 20},
@@ -77,7 +83,6 @@ func initialModel() model {
 			{Title: "Total", Width: 15},
 			{Title: "Used%", Width: 10},
 		}),
-		table.WithHeight(4),
 		table.WithStyles(tableStyle),
 	)
 
@@ -137,6 +142,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
+		m.height = msg.Height
 
 	case tickMsg:
 		m.lastUpdate = time.Time(msg)
@@ -207,6 +213,7 @@ func (m *model) updateTables() {
 		})
 	}
 	m.cpuTable.SetRows(cpuRows)
+	m.cpuTable.SetHeight(len(cpuRows))
 
 	// Update memory table
 	var memRows []table.Row
@@ -227,6 +234,7 @@ func (m *model) updateTables() {
 		})
 	}
 	m.memTable.SetRows(memRows)
+	m.memTable.SetHeight(len(memRows))
 
 	// Update disk table
 	var diskRows []table.Row
@@ -250,7 +258,13 @@ func (m *model) updateTables() {
 		fmt.Sscanf(jPercent, "%f", &jVal)
 		return iVal > jVal
 	})
+	
+	// Only show top 5 disks
+	if len(diskRows) > 5 {
+		diskRows = diskRows[:5]
+	}
 	m.diskTable.SetRows(diskRows)
+	m.diskTable.SetHeight(len(diskRows))
 
 	// Update network table
 	var netRows []table.Row
@@ -266,6 +280,7 @@ func (m *model) updateTables() {
 		}
 	}
 	m.netTable.SetRows(netRows)
+	m.netTable.SetHeight(len(netRows))
 }
 
 func (m model) View() string {
@@ -273,10 +288,21 @@ func (m model) View() string {
 		return "Loading..."
 	}
 
+	// Calculate available space for sections
+	availWidth := m.width
+	minColumnWidth := 85 // Minimum width needed for a column
+	useVerticalLayout := availWidth < minColumnWidth*2
+
 	style := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("#7287fd")).
 		Padding(0, 1)
+
+	if useVerticalLayout {
+		style = style.Width(availWidth - 4)
+	} else {
+		style = style.Width(availWidth/2 - 4)
+	}
 
 	headerStyle := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("#8caaee")).
@@ -285,7 +311,7 @@ func (m model) View() string {
 	// Create sections with nil checks
 	var cpuSection string
 	if m.loadAvg != nil {
-		cpuSection = style.Render(
+		cpuSection = style.Copy().Width(availWidth/3 - 4).Render(
 			lipgloss.JoinVertical(
 				lipgloss.Left,
 				headerStyle.Render("CPU"),
@@ -297,7 +323,7 @@ func (m model) View() string {
 			),
 		)
 	} else {
-		cpuSection = style.Render(
+		cpuSection = style.Copy().Width(availWidth/3 - 4).Render(
 			lipgloss.JoinVertical(
 				lipgloss.Left,
 				headerStyle.Render("CPU"),
@@ -307,7 +333,7 @@ func (m model) View() string {
 		)
 	}
 
-	memSection := style.Render(
+	memSection := style.Copy().Width(2*availWidth/3 - 4).Render(
 		lipgloss.JoinVertical(
 			lipgloss.Left,
 			headerStyle.Render("Memory"),
@@ -327,11 +353,27 @@ func (m model) View() string {
 		),
 	)
 
-	// Combine sections
-	top := lipgloss.JoinHorizontal(lipgloss.Top, cpuSection, memSection)
-	bottom := lipgloss.JoinHorizontal(lipgloss.Top, diskSection, netSection)
+	// Always keep CPU and Memory together
+	topRow := lipgloss.JoinHorizontal(lipgloss.Top, cpuSection, memSection)
 
-	return lipgloss.JoinVertical(lipgloss.Left, top, bottom)
+	// Combine sections based on layout
+	var finalLayout string
+	if useVerticalLayout {
+		finalLayout = lipgloss.JoinVertical(
+			lipgloss.Left,
+			topRow,
+			diskSection,
+			netSection,
+		)
+	} else {
+		bottom := lipgloss.JoinHorizontal(lipgloss.Top, diskSection, netSection)
+		finalLayout = lipgloss.JoinVertical(lipgloss.Left, topRow, bottom)
+	}
+
+	return lipgloss.NewStyle().
+		MaxWidth(m.width).
+		MaxHeight(m.height).
+		Render(finalLayout)
 }
 
 func init() {
