@@ -23,7 +23,8 @@ var dashboardCmd = &cobra.Command{
 	Aliases: []string{"dash"},
 	Short:   "Display system metrics in an interactive dashboard",
 	Long: `Display all system metrics in an interactive dashboard.
-Use arrow keys to navigate between sections.
+Use arrow keys to scroll through tables.
+Press tab to switch between tables.
 Press 'q' to quit.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		p := tea.NewProgram(
@@ -35,6 +36,14 @@ Press 'q' to quit.`,
 		return err
 	},
 }
+
+type focusedTable int
+
+const (
+	cpuTableFocus focusedTable = iota
+	diskTableFocus
+	netTableFocus
+)
 
 type model struct {
 	cpuPercents    []float64
@@ -53,6 +62,7 @@ type model struct {
 	cpuTable       table.Model
 	memTable       table.Model
 	netTable       table.Model
+	focusedTable   focusedTable
 }
 
 func initialModel() model {
@@ -64,6 +74,11 @@ func initialModel() model {
 		BorderBottom(true).
 		Bold(true)
 
+	// Highlight selected row
+	tableStyle.Selected = tableStyle.Selected.
+		Foreground(lipgloss.Color("#a6d189")).
+		Bold(true)
+
 	m := model{
 		diskUsage:      make(map[string]*disk.UsageStat),
 		netStats:       make(map[string]netlink.LinkStatistics),
@@ -72,6 +87,7 @@ func initialModel() model {
 		cpuPercents:    make([]float64, 0),
 		diskPartitions: make([]disk.PartitionStat, 0),
 		netInterfaces:  make([]netlink.Link, 0),
+		focusedTable:   cpuTableFocus,
 	}
 
 	// Initialize tables with minimal widths
@@ -84,6 +100,7 @@ func initialModel() model {
 			{Title: "Used%", Width: 10},
 		}),
 		table.WithStyles(tableStyle),
+		table.WithHeight(6),
 	)
 
 	m.cpuTable = table.New(
@@ -92,6 +109,8 @@ func initialModel() model {
 			{Title: "Usage(u)", Width: 10},
 		}),
 		table.WithStyles(tableStyle),
+		table.WithHeight(6),
+		table.WithFocused(true),
 	)
 
 	m.memTable = table.New(
@@ -112,6 +131,7 @@ func initialModel() model {
 			{Title: "Total(s)", Width: 20},
 		}),
 		table.WithStyles(tableStyle),
+		table.WithHeight(6),
 	)
 
 	return m
@@ -120,10 +140,7 @@ func initialModel() model {
 type tickMsg time.Time
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(
-		tea.EnterAltScreen,
-		tickCmd(),
-	)
+	return tickCmd()
 }
 
 func tickCmd() tea.Cmd {
@@ -138,6 +155,40 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
+		case "tab":
+			// Cycle through tables
+			m.focusedTable = (m.focusedTable + 1) % 3
+			
+			// Update table selection states
+			switch m.focusedTable {
+			case cpuTableFocus:
+				m.cpuTable.SetRows(m.cpuTable.Rows())
+				m.cpuTable.Focus()
+				m.diskTable.Blur()
+				m.netTable.Blur()
+			case diskTableFocus:
+				m.diskTable.SetRows(m.diskTable.Rows())
+				m.diskTable.Focus()
+				m.cpuTable.Blur()
+				m.netTable.Blur()
+			case netTableFocus:
+				m.netTable.SetRows(m.netTable.Rows())
+				m.netTable.Focus()
+				m.cpuTable.Blur()
+				m.diskTable.Blur()
+			}
+			return m, nil
+		case "up", "down", "pageup", "pagedown", "home", "end":
+			var cmd tea.Cmd
+			switch m.focusedTable {
+			case cpuTableFocus:
+				m.cpuTable, cmd = m.cpuTable.Update(msg)
+			case diskTableFocus:
+				m.diskTable, cmd = m.diskTable.Update(msg)
+			case netTableFocus:
+				m.netTable, cmd = m.netTable.Update(msg)
+			}
+			return m, cmd
 		}
 
 	case tea.WindowSizeMsg:
@@ -213,7 +264,6 @@ func (m *model) updateTables() {
 		})
 	}
 	m.cpuTable.SetRows(cpuRows)
-	m.cpuTable.SetHeight(len(cpuRows))
 
 	// Update memory table
 	var memRows []table.Row
@@ -258,13 +308,7 @@ func (m *model) updateTables() {
 		fmt.Sscanf(jPercent, "%f", &jVal)
 		return iVal > jVal
 	})
-	
-	// Only show top 5 disks
-	if len(diskRows) > 5 {
-		diskRows = diskRows[:5]
-	}
 	m.diskTable.SetRows(diskRows)
-	m.diskTable.SetHeight(len(diskRows))
 
 	// Update network table
 	var netRows []table.Row
@@ -280,7 +324,6 @@ func (m *model) updateTables() {
 		}
 	}
 	m.netTable.SetRows(netRows)
-	m.netTable.SetHeight(len(netRows))
 }
 
 func (m model) View() string {
@@ -314,7 +357,7 @@ func (m model) View() string {
 		cpuSection = style.Copy().Width(availWidth/3 - 4).Render(
 			lipgloss.JoinVertical(
 				lipgloss.Left,
-				headerStyle.Render("CPU"),
+				headerStyle.Render(fmt.Sprintf("CPU %s", m.getFocusIndicator(cpuTableFocus))),
 				m.cpuTable.View(),
 				fmt.Sprintf("Load: %.2f %.2f %.2f",
 					m.loadAvg.Load1,
@@ -326,7 +369,7 @@ func (m model) View() string {
 		cpuSection = style.Copy().Width(availWidth/3 - 4).Render(
 			lipgloss.JoinVertical(
 				lipgloss.Left,
-				headerStyle.Render("CPU"),
+				headerStyle.Render(fmt.Sprintf("CPU %s", m.getFocusIndicator(cpuTableFocus))),
 				m.cpuTable.View(),
 				"Load: N/A",
 			),
@@ -342,13 +385,17 @@ func (m model) View() string {
 	)
 
 	diskSection := style.Render(
-		m.diskTable.View(),
+		lipgloss.JoinVertical(
+			lipgloss.Left,
+			headerStyle.Render(fmt.Sprintf("Disks %s", m.getFocusIndicator(diskTableFocus))),
+			m.diskTable.View(),
+		),
 	)
 
 	netSection := style.Render(
 		lipgloss.JoinVertical(
 			lipgloss.Left,
-			headerStyle.Render("Network"),
+			headerStyle.Render(fmt.Sprintf("Network %s", m.getFocusIndicator(netTableFocus))),
 			m.netTable.View(),
 		),
 	)
@@ -374,6 +421,13 @@ func (m model) View() string {
 		MaxWidth(m.width).
 		MaxHeight(m.height).
 		Render(finalLayout)
+}
+
+func (m model) getFocusIndicator(t focusedTable) string {
+	if m.focusedTable == t {
+		return "●"
+	}
+	return ""
 }
 
 func init() {
