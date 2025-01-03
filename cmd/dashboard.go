@@ -328,7 +328,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "tab":
 			if m.currentView == dashboardView {
 				m.focusedTable = (m.focusedTable + 1) % 3
-				
+
 				switch m.focusedTable {
 				case cpuTableFocus:
 					m.cpuTable.Focus()
@@ -660,13 +660,13 @@ func (m model) getFocusIndicator(t focusedTable) string {
 }
 
 var dashboardCmd = &cobra.Command{
-	Use:   "dashboard",
+	Use:     "dashboard",
 	Aliases: []string{"dash"},
-	Short: "Interactive system dashboard",
+	Short:   "Interactive system dashboard",
 	Run: func(cmd *cobra.Command, args []string) {
 		p := tea.NewProgram(initialModel(),
-		tea.WithAltScreen(),
-		tea.WithMouseCellMotion())
+			tea.WithAltScreen(),
+			tea.WithMouseCellMotion())
 		if _, err := p.Run(); err != nil {
 			fmt.Printf("Error running program: %v\n", err)
 		}
