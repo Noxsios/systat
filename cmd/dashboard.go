@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/bubbles/table"
@@ -73,6 +74,17 @@ type dnsCheckMsg struct {
 type pingCheckMsg struct {
 	host   string
 	status bool
+}
+
+type statsUpdateMsg struct {
+	cpuPercents    []float64
+	loadAvg        *load.AvgStat
+	memory         *mem.VirtualMemoryStat
+	swap           *mem.SwapMemoryStat
+	diskStats      map[string]disk.IOCountersStat
+	diskPartitions []disk.PartitionStat
+	diskUsage      map[string]*disk.UsageStat
+	netStats       map[string]psnet.IOCountersStat
 }
 
 func initialModel() model {
@@ -183,6 +195,116 @@ func checkPingCmd(host string) tea.Cmd {
 	}
 }
 
+func (m *model) updateStats() tea.Cmd {
+	return func() tea.Msg {
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		msg := statsUpdateMsg{
+			diskUsage: make(map[string]*disk.UsageStat),
+			diskStats: make(map[string]disk.IOCountersStat),
+			netStats:  make(map[string]psnet.IOCountersStat),
+		}
+
+		// CPU stats
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if percents, err := cpu.Percent(0, true); err == nil {
+				mu.Lock()
+				msg.cpuPercents = percents
+				mu.Unlock()
+			}
+		}()
+
+		// Load average
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if loadAvg, err := load.Avg(); err == nil {
+				mu.Lock()
+				msg.loadAvg = loadAvg
+				mu.Unlock()
+			}
+		}()
+
+		// Memory stats
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if vmem, err := mem.VirtualMemory(); err == nil {
+				mu.Lock()
+				msg.memory = vmem
+				mu.Unlock()
+			}
+		}()
+
+		// Swap stats
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if swap, err := mem.SwapMemory(); err == nil {
+				mu.Lock()
+				msg.swap = swap
+				mu.Unlock()
+			}
+		}()
+
+		// Disk IO stats
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if iostats, err := disk.IOCounters(); err == nil {
+				mu.Lock()
+				msg.diskStats = iostats
+				mu.Unlock()
+			}
+		}()
+
+		// Disk partitions and usage
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if partitions, err := disk.Partitions(false); err == nil {
+				mu.Lock()
+				msg.diskPartitions = partitions
+				mu.Unlock()
+
+				var usageWg sync.WaitGroup
+				for _, partition := range partitions {
+					usageWg.Add(1)
+					go func(p disk.PartitionStat) {
+						defer usageWg.Done()
+						if usage, err := disk.Usage(p.Mountpoint); err == nil {
+							mu.Lock()
+							msg.diskUsage[p.Mountpoint] = usage
+							mu.Unlock()
+						}
+					}(partition)
+				}
+				usageWg.Wait()
+			}
+		}()
+
+		// Network stats
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if iostats, err := psnet.IOCounters(false); err == nil {
+				netStats := make(map[string]psnet.IOCountersStat)
+				for _, stat := range iostats {
+					netStats[stat.Name] = stat
+				}
+				mu.Lock()
+				msg.netStats = netStats
+				mu.Unlock()
+			}
+		}()
+
+		wg.Wait()
+		return msg
+	}
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
@@ -269,51 +391,36 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		m.updateTables()
+
+	case statsUpdateMsg:
+		if len(msg.cpuPercents) > 0 {
+			m.cpuPercents = msg.cpuPercents
+		}
+		if msg.loadAvg != nil {
+			m.loadAvg = msg.loadAvg
+		}
+		if msg.memory != nil {
+			m.memory = msg.memory
+		}
+		if msg.swap != nil {
+			m.swap = msg.swap
+		}
+		if len(msg.diskStats) > 0 {
+			m.diskStats = msg.diskStats
+		}
+		if len(msg.diskPartitions) > 0 {
+			m.diskPartitions = msg.diskPartitions
+		}
+		if len(msg.diskUsage) > 0 {
+			m.diskUsage = msg.diskUsage
+		}
+		if len(msg.netStats) > 0 {
+			m.netStats = msg.netStats
+		}
+		m.updateTables()
 	}
 
 	return m, nil
-}
-
-func (m *model) updateStats() tea.Cmd {
-	return func() tea.Msg {
-		if percents, err := cpu.Percent(0, true); err == nil {
-			m.cpuPercents = percents
-		}
-
-		if loadAvg, err := load.Avg(); err == nil {
-			m.loadAvg = loadAvg
-		}
-
-		if vmem, err := mem.VirtualMemory(); err == nil {
-			m.memory = vmem
-		}
-
-		if swap, err := mem.SwapMemory(); err == nil {
-			m.swap = swap
-		}
-
-		if iostats, err := disk.IOCounters(); err == nil {
-			m.diskStats = iostats
-		}
-
-		if partitions, err := disk.Partitions(false); err == nil {
-			m.diskPartitions = partitions
-			for _, partition := range partitions {
-				if usage, err := disk.Usage(partition.Mountpoint); err == nil {
-					m.diskUsage[partition.Mountpoint] = usage
-				}
-			}
-		}
-
-		if iostats, err := psnet.IOCounters(false); err == nil {
-			for _, stat := range iostats {
-				m.netStats[stat.Name] = stat
-			}
-		}
-
-		m.updateTables()
-		return nil
-	}
 }
 
 func (m *model) updateTables() {
@@ -553,12 +660,19 @@ func (m model) getFocusIndicator(t focusedTable) string {
 }
 
 var dashboardCmd = &cobra.Command{
-	Use:   "dash",
+	Use:   "dashboard",
+	Aliases: []string{"dash"},
 	Short: "Interactive system dashboard",
 	Run: func(cmd *cobra.Command, args []string) {
-		p := tea.NewProgram(initialModel())
+		p := tea.NewProgram(initialModel(),
+		tea.WithAltScreen(),
+		tea.WithMouseCellMotion())
 		if _, err := p.Run(); err != nil {
 			fmt.Printf("Error running program: %v\n", err)
 		}
 	},
+}
+
+func init() {
+	rootCmd.AddCommand(dashboardCmd)
 }
