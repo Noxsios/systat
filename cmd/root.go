@@ -17,10 +17,18 @@ var (
 
 var rootCmd = &cobra.Command{
 	Use:   "systat",
-	Short: "A system information and DNS query CLI tool",
-	Long: `systat is a CLI tool that provides system information and DNS queries.
-It can query DNS information for *.admin.uds.dev and *.uds.dev domains,
-display system information, and show detailed system metrics.`,
+	Short: "A comprehensive system information and monitoring CLI tool",
+	Long: `systat is a powerful CLI tool for system monitoring and information gathering.
+	
+Features:
+  - System information and metrics
+  - Network monitoring (Linux)
+  - Process management
+  - Disk usage statistics
+  - DNS queries
+  - Kubernetes information
+  
+All commands support JSON output (--json), raw output (--raw), and watch mode (--watch).`,
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
