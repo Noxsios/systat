@@ -1,9 +1,11 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -19,6 +21,11 @@ import (
 	"github.com/shirou/gopsutil/v3/mem"
 	psnet "github.com/shirou/gopsutil/v3/net"
 	"github.com/spf13/cobra"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/util/homedir"
 )
 
 type viewMode int
@@ -51,6 +58,8 @@ type model struct {
 	diskUsage      map[string]*disk.UsageStat
 	netStats       map[string]psnet.IOCountersStat
 	statusChecks   []statusCheck
+	k8sClient      *kubernetes.Clientset
+	namespaces     []corev1.Namespace
 	width          int
 	height         int
 	lastUpdate     time.Time
@@ -59,6 +68,7 @@ type model struct {
 	memTable       table.Model
 	netTable       table.Model
 	statusTable    table.Model
+	k8sTable       table.Model
 	focusedTable   focusedTable
 	currentView    viewMode
 	selectedIface  string
@@ -85,6 +95,7 @@ type statsUpdateMsg struct {
 	diskPartitions []disk.PartitionStat
 	diskUsage      map[string]*disk.UsageStat
 	netStats       map[string]psnet.IOCountersStat
+	namespaces     []corev1.Namespace
 }
 
 func initialModel() model {
@@ -106,9 +117,23 @@ func initialModel() model {
 		lastUpdate:     time.Now(),
 		cpuPercents:    make([]float64, 0),
 		diskPartitions: make([]disk.PartitionStat, 0),
-		statusChecks:   make([]statusCheck, 0),
+		statusChecks: []statusCheck{
+			{name: "runtime.uds.dev", status: false},
+			{name: "keycloak.admin.uds.dev", status: false},
+			{name: "ping 10.0.0.1", status: false},
+		},
 		focusedTable:   cpuTableFocus,
 		currentView:    dashboardView,
+	}
+
+	// Initialize k8s client
+	home := homedir.HomeDir()
+	if home != "" {
+		kubeconfig := filepath.Join(home, ".kube", "config")
+		config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+		if err == nil {
+			m.k8sClient, _ = kubernetes.NewForConfig(config)
+		}
 	}
 
 	m.diskTable = table.New(
@@ -161,6 +186,16 @@ func initialModel() model {
 		}),
 		table.WithStyles(tableStyle),
 		table.WithHeight(4),
+	)
+
+	m.k8sTable = table.New(
+		table.WithColumns([]table.Column{
+			{Title: "Namespace", Width: 30},
+			{Title: "Status", Width: 10},
+			{Title: "Age", Width: 15},
+		}),
+		table.WithStyles(tableStyle),
+		table.WithHeight(6),
 	)
 
 	return m
@@ -300,6 +335,19 @@ func (m *model) updateStats() tea.Cmd {
 			}
 		}()
 
+		// K8s stats
+		if m.k8sClient != nil {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if namespaces, err := m.k8sClient.CoreV1().Namespaces().List(context.Background(), metav1.ListOptions{}); err == nil {
+					mu.Lock()
+					msg.namespaces = namespaces.Items
+					mu.Unlock()
+				}
+			}()
+		}
+
 		wg.Wait()
 		return msg
 	}
@@ -375,8 +423,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		)
 
 	case dnsCheckMsg:
-		for i, check := range m.statusChecks {
-			if check.name == msg.host {
+		for i := range m.statusChecks {
+			if m.statusChecks[i].name == msg.host {
 				m.statusChecks[i].status = msg.status
 				break
 			}
@@ -384,8 +432,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.updateTables()
 
 	case pingCheckMsg:
-		for i, check := range m.statusChecks {
-			if check.name == "ping "+msg.host {
+		for i := range m.statusChecks {
+			if m.statusChecks[i].name == "ping "+msg.host {
 				m.statusChecks[i].status = msg.status
 				break
 			}
@@ -417,7 +465,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if len(msg.netStats) > 0 {
 			m.netStats = msg.netStats
 		}
+		if len(msg.namespaces) > 0 {
+			m.namespaces = msg.namespaces
+		}
 		m.updateTables()
+		return m, nil
 	}
 
 	return m, nil
@@ -489,8 +541,8 @@ func (m *model) updateTables() {
 			netRows = append(netRows, table.Row{
 				stats.Name,
 				strings.Join(ipv4s, ", "),
-				humanize.Bytes(stats.BytesRecv),
-				humanize.Bytes(stats.BytesSent),
+				humanize.Bytes(uint64(stats.BytesRecv)),
+				humanize.Bytes(uint64(stats.BytesSent)),
 			})
 		}
 	}
@@ -504,6 +556,22 @@ func (m *model) updateTables() {
 		})
 	}
 	m.statusTable.SetRows(statusRows)
+
+	if m.k8sClient != nil {
+		var k8sRows []table.Row
+		for _, ns := range m.namespaces {
+			status := "🟢"
+			if ns.Status.Phase != "Active" {
+				status = "🔴"
+			}
+			k8sRows = append(k8sRows, table.Row{
+				ns.Name,
+				status,
+				humanize.Time(ns.CreationTimestamp.Time),
+			})
+		}
+		m.k8sTable.SetRows(k8sRows)
+	}
 }
 
 func getStatusSymbol(ok bool) string {
@@ -540,6 +608,15 @@ func (m model) View() string {
 	headerStyle := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("#8caaee")).
 		Bold(true)
+
+	// Status section at the top
+	statusSection := style.Copy().Width(availWidth - 2).Render(
+		lipgloss.JoinVertical(
+			lipgloss.Left,
+			headerStyle.Render("Status"),
+			m.statusTable.View(),
+		),
+	)
 
 	var cpuSection string
 	if m.loadAvg != nil {
@@ -598,16 +675,23 @@ func (m model) View() string {
 		),
 	)
 
-	statusSection := style.Render(
-		lipgloss.JoinVertical(
-			lipgloss.Left,
-			headerStyle.Render("Status"),
-			m.statusTable.View(),
-		),
-	)
+	var k8sSection string
+	if m.k8sClient != nil {
+		k8sSection = style.Render(
+			lipgloss.JoinVertical(
+				lipgloss.Left,
+				headerStyle.Render("Kubernetes"),
+				m.k8sTable.View(),
+			),
+		)
+	}
 
-	bottomRow := lipgloss.JoinHorizontal(lipgloss.Top, netSection, statusSection)
-	finalLayout := lipgloss.JoinVertical(lipgloss.Left, topRow, bottomRow)
+	bottomRow := lipgloss.JoinHorizontal(lipgloss.Top, netSection, k8sSection)
+	finalLayout := lipgloss.JoinVertical(lipgloss.Left,
+		statusSection,
+		topRow,
+		bottomRow,
+	)
 
 	return lipgloss.NewStyle().
 		MaxWidth(m.width).
