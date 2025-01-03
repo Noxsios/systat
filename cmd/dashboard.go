@@ -2,6 +2,8 @@ package cmd
 
 import (
 	"fmt"
+	"net"
+	"os/exec"
 	"sort"
 	"strings"
 	"time"
@@ -14,36 +16,8 @@ import (
 	"github.com/shirou/gopsutil/v3/disk"
 	"github.com/shirou/gopsutil/v3/load"
 	"github.com/shirou/gopsutil/v3/mem"
-	"github.com/shirou/gopsutil/v3/net"
+	psnet "github.com/shirou/gopsutil/v3/net"
 	"github.com/spf13/cobra"
-	"github.com/vishvananda/netlink"
-)
-
-var dashboardCmd = &cobra.Command{
-	Use:     "dashboard",
-	Aliases: []string{"dash"},
-	Short:   "Display system metrics in an interactive dashboard",
-	Long: `Display all system metrics in an interactive dashboard.
-Use arrow keys to scroll through tables.
-Press tab to switch between tables.
-Press 'q' to quit.`,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		p := tea.NewProgram(
-			initialModel(),
-			tea.WithAltScreen(),
-			tea.WithMouseCellMotion(),
-		)
-		_, err := p.Run()
-		return err
-	},
-}
-
-type focusedTable int
-
-const (
-	cpuTableFocus focusedTable = iota
-	diskTableFocus
-	netTableFocus
 )
 
 type viewMode int
@@ -53,6 +27,19 @@ const (
 	networkDetailView
 )
 
+type focusedTable int
+
+const (
+	cpuTableFocus focusedTable = iota
+	diskTableFocus
+	netTableFocus
+)
+
+type statusCheck struct {
+	name   string
+	status bool
+}
+
 type model struct {
 	cpuPercents    []float64
 	loadAvg        *load.AvgStat
@@ -61,8 +48,8 @@ type model struct {
 	diskStats      map[string]disk.IOCountersStat
 	diskPartitions []disk.PartitionStat
 	diskUsage      map[string]*disk.UsageStat
-	netInterfaces  []netlink.Link
-	netStats       map[string]net.IOCountersStat
+	netStats       map[string]psnet.IOCountersStat
+	statusChecks   []statusCheck
 	width          int
 	height         int
 	lastUpdate     time.Time
@@ -70,13 +57,25 @@ type model struct {
 	cpuTable       table.Model
 	memTable       table.Model
 	netTable       table.Model
+	statusTable    table.Model
 	focusedTable   focusedTable
 	currentView    viewMode
 	selectedIface  string
 }
 
+type tickMsg time.Time
+
+type dnsCheckMsg struct {
+	host   string
+	status bool
+}
+
+type pingCheckMsg struct {
+	host   string
+	status bool
+}
+
 func initialModel() model {
-	// Initialize tables with default styles
 	tableStyle := table.DefaultStyles()
 	tableStyle.Header = tableStyle.Header.
 		BorderStyle(lipgloss.NormalBorder()).
@@ -84,24 +83,22 @@ func initialModel() model {
 		BorderBottom(true).
 		Bold(true)
 
-	// Highlight selected row
 	tableStyle.Selected = tableStyle.Selected.
 		Foreground(lipgloss.Color("#a6d189")).
 		Bold(true)
 
 	m := model{
 		diskUsage:      make(map[string]*disk.UsageStat),
-		netStats:       make(map[string]net.IOCountersStat),
+		netStats:       make(map[string]psnet.IOCountersStat),
 		diskStats:      make(map[string]disk.IOCountersStat),
 		lastUpdate:     time.Now(),
 		cpuPercents:    make([]float64, 0),
 		diskPartitions: make([]disk.PartitionStat, 0),
-		netInterfaces:  make([]netlink.Link, 0),
+		statusChecks:   make([]statusCheck, 0),
 		focusedTable:   cpuTableFocus,
 		currentView:    dashboardView,
 	}
 
-	// Initialize tables with minimal widths and no padding
 	m.diskTable = table.New(
 		table.WithColumns([]table.Column{
 			{Title: "Disk(d)", Width: 20},
@@ -137,6 +134,7 @@ func initialModel() model {
 	m.netTable = table.New(
 		table.WithColumns([]table.Column{
 			{Title: "Iface(i)", Width: 15},
+			{Title: "IPv4(4)", Width: 20},
 			{Title: "RX(r)", Width: 20},
 			{Title: "TX(t)", Width: 20},
 		}),
@@ -144,19 +142,45 @@ func initialModel() model {
 		table.WithHeight(6),
 	)
 
+	m.statusTable = table.New(
+		table.WithColumns([]table.Column{
+			{Title: "Service", Width: 30},
+			{Title: "Status", Width: 10},
+		}),
+		table.WithStyles(tableStyle),
+		table.WithHeight(4),
+	)
+
 	return m
 }
 
-type tickMsg time.Time
-
 func (m model) Init() tea.Cmd {
-	return tickCmd()
+	return tea.Batch(
+		tickCmd(),
+		checkDNSCmd("runtime.uds.dev"),
+		checkDNSCmd("keycloak.admin.uds.dev"),
+		checkPingCmd("10.0.0.1"),
+	)
 }
 
 func tickCmd() tea.Cmd {
 	return tea.Tick(time.Second, func(t time.Time) tea.Msg {
 		return tickMsg(t)
 	})
+}
+
+func checkDNSCmd(host string) tea.Cmd {
+	return func() tea.Msg {
+		_, err := net.LookupHost(host)
+		return dnsCheckMsg{host: host, status: err == nil}
+	}
+}
+
+func checkPingCmd(host string) tea.Cmd {
+	return func() tea.Msg {
+		cmd := exec.Command("ping", "-c", "1", "-W", "1", host)
+		return pingCheckMsg{host: host, status: cmd.Run() == nil}
+	}
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -181,23 +205,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "tab":
 			if m.currentView == dashboardView {
-				// Cycle through tables
 				m.focusedTable = (m.focusedTable + 1) % 3
 				
-				// Update table selection states
 				switch m.focusedTable {
 				case cpuTableFocus:
-					m.cpuTable.SetRows(m.cpuTable.Rows())
 					m.cpuTable.Focus()
 					m.diskTable.Blur()
 					m.netTable.Blur()
 				case diskTableFocus:
-					m.diskTable.SetRows(m.diskTable.Rows())
 					m.diskTable.Focus()
 					m.cpuTable.Blur()
 					m.netTable.Blur()
 				case netTableFocus:
-					m.netTable.SetRows(m.netTable.Rows())
 					m.netTable.Focus()
 					m.cpuTable.Blur()
 					m.diskTable.Blur()
@@ -225,33 +244,58 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		m.lastUpdate = time.Time(msg)
-		
-		// Update CPU stats
+		return m, tea.Batch(
+			m.updateStats(),
+			tickCmd(),
+			checkDNSCmd("runtime.uds.dev"),
+			checkDNSCmd("keycloak.admin.uds.dev"),
+			checkPingCmd("10.0.0.1"),
+		)
+
+	case dnsCheckMsg:
+		for i, check := range m.statusChecks {
+			if check.name == msg.host {
+				m.statusChecks[i].status = msg.status
+				break
+			}
+		}
+		m.updateTables()
+
+	case pingCheckMsg:
+		for i, check := range m.statusChecks {
+			if check.name == "ping "+msg.host {
+				m.statusChecks[i].status = msg.status
+				break
+			}
+		}
+		m.updateTables()
+	}
+
+	return m, nil
+}
+
+func (m *model) updateStats() tea.Cmd {
+	return func() tea.Msg {
 		if percents, err := cpu.Percent(0, true); err == nil {
 			m.cpuPercents = percents
 		}
 
-		// Update load average
 		if loadAvg, err := load.Avg(); err == nil {
 			m.loadAvg = loadAvg
 		}
 
-		// Update memory stats
 		if vmem, err := mem.VirtualMemory(); err == nil {
 			m.memory = vmem
 		}
 
-		// Update swap stats
 		if swap, err := mem.SwapMemory(); err == nil {
 			m.swap = swap
 		}
 
-		// Update disk stats
 		if iostats, err := disk.IOCounters(); err == nil {
 			m.diskStats = iostats
 		}
 
-		// Update disk partitions
 		if partitions, err := disk.Partitions(false); err == nil {
 			m.diskPartitions = partitions
 			for _, partition := range partitions {
@@ -261,24 +305,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		// Update network stats
-		if iostats, err := net.IOCounters(false); err == nil {
+		if iostats, err := psnet.IOCounters(false); err == nil {
 			for _, stat := range iostats {
 				m.netStats[stat.Name] = stat
 			}
 		}
 
-		// Update tables
 		m.updateTables()
-
-		return m, tickCmd()
+		return nil
 	}
-
-	return m, nil
 }
 
 func (m *model) updateTables() {
-	// Update CPU table
 	var cpuRows []table.Row
 	for i, percent := range m.cpuPercents {
 		cpuRows = append(cpuRows, table.Row{
@@ -288,7 +326,6 @@ func (m *model) updateTables() {
 	}
 	m.cpuTable.SetRows(cpuRows)
 
-	// Update memory table
 	var memRows []table.Row
 	if m.memory != nil {
 		memRows = append(memRows, table.Row{
@@ -309,7 +346,6 @@ func (m *model) updateTables() {
 	m.memTable.SetRows(memRows)
 	m.memTable.SetHeight(len(memRows))
 
-	// Update disk table
 	var diskRows []table.Row
 	for _, partition := range m.diskPartitions {
 		if usage, ok := m.diskUsage[partition.Mountpoint]; ok {
@@ -322,7 +358,6 @@ func (m *model) updateTables() {
 			})
 		}
 	}
-	// Sort by usage percentage
 	sort.Slice(diskRows, func(i, j int) bool {
 		iPercent := strings.TrimSuffix(diskRows[i][4], "%")
 		jPercent := strings.TrimSuffix(diskRows[j][4], "%")
@@ -333,16 +368,42 @@ func (m *model) updateTables() {
 	})
 	m.diskTable.SetRows(diskRows)
 
-	// Update network table
 	var netRows []table.Row
-	for _, stats := range m.netStats {
-		netRows = append(netRows, table.Row{
-			stats.Name,
-			humanize.Bytes(stats.BytesRecv),
-			humanize.Bytes(stats.BytesSent),
-		})
+	ifaces, _ := net.Interfaces()
+	for _, iface := range ifaces {
+		if stats, ok := m.netStats[iface.Name]; ok {
+			addrs, _ := iface.Addrs()
+			var ipv4s []string
+			for _, addr := range addrs {
+				if ipnet, ok := addr.(*net.IPNet); ok && ipnet.IP.To4() != nil {
+					ipv4s = append(ipv4s, ipnet.IP.String())
+				}
+			}
+			netRows = append(netRows, table.Row{
+				stats.Name,
+				strings.Join(ipv4s, ", "),
+				humanize.Bytes(stats.BytesRecv),
+				humanize.Bytes(stats.BytesSent),
+			})
+		}
 	}
 	m.netTable.SetRows(netRows)
+
+	var statusRows []table.Row
+	for _, check := range m.statusChecks {
+		statusRows = append(statusRows, table.Row{
+			check.name,
+			getStatusSymbol(check.status),
+		})
+	}
+	m.statusTable.SetRows(statusRows)
+}
+
+func getStatusSymbol(ok bool) string {
+	if ok {
+		return "🟢"
+	}
+	return "🔴"
 }
 
 func (m model) View() string {
@@ -354,9 +415,8 @@ func (m model) View() string {
 		return m.networkDetailView()
 	}
 
-	// Calculate available space for sections
 	availWidth := m.width
-	minColumnWidth := 85 // Minimum width needed for a column
+	minColumnWidth := 85
 	useVerticalLayout := availWidth < minColumnWidth*2
 
 	style := lipgloss.NewStyle().
@@ -374,7 +434,6 @@ func (m model) View() string {
 		Foreground(lipgloss.Color("#8caaee")).
 		Bold(true)
 
-	// Create sections with nil checks
 	var cpuSection string
 	if m.loadAvg != nil {
 		cpuSection = style.Copy().Width(availWidth/3 - 2).Render(
@@ -382,6 +441,9 @@ func (m model) View() string {
 				lipgloss.Left,
 				headerStyle.Render(fmt.Sprintf("CPU %s", m.getFocusIndicator(cpuTableFocus))),
 				m.cpuTable.View(),
+				"",
+				"",
+				"",
 				fmt.Sprintf("Load: %.2f %.2f %.2f",
 					m.loadAvg.Load1,
 					m.loadAvg.Load5,
@@ -394,10 +456,21 @@ func (m model) View() string {
 				lipgloss.Left,
 				headerStyle.Render(fmt.Sprintf("CPU %s", m.getFocusIndicator(cpuTableFocus))),
 				m.cpuTable.View(),
+				"",
+				"",
+				"",
 				"Load: N/A",
 			),
 		)
 	}
+
+	diskSection := style.Copy().Width(2*availWidth/3 - 2).Render(
+		lipgloss.JoinVertical(
+			lipgloss.Left,
+			headerStyle.Render(fmt.Sprintf("Disks %s", m.getFocusIndicator(diskTableFocus))),
+			m.diskTable.View(),
+		),
+	)
 
 	memSection := style.Copy().Width(2*availWidth/3 - 2).Render(
 		lipgloss.JoinVertical(
@@ -407,13 +480,8 @@ func (m model) View() string {
 		),
 	)
 
-	diskSection := style.Render(
-		lipgloss.JoinVertical(
-			lipgloss.Left,
-			headerStyle.Render(fmt.Sprintf("Disks %s", m.getFocusIndicator(diskTableFocus))),
-			m.diskTable.View(),
-		),
-	)
+	rightStack := lipgloss.JoinVertical(lipgloss.Left, diskSection, memSection)
+	topRow := lipgloss.JoinHorizontal(lipgloss.Top, cpuSection, rightStack)
 
 	netSection := style.Render(
 		lipgloss.JoinVertical(
@@ -423,22 +491,16 @@ func (m model) View() string {
 		),
 	)
 
-	// Always keep CPU and Memory together
-	topRow := lipgloss.JoinHorizontal(lipgloss.Top, cpuSection, memSection)
-
-	// Combine sections based on layout
-	var finalLayout string
-	if useVerticalLayout {
-		finalLayout = lipgloss.JoinVertical(
+	statusSection := style.Render(
+		lipgloss.JoinVertical(
 			lipgloss.Left,
-			topRow,
-			diskSection,
-			netSection,
-		)
-	} else {
-		bottom := lipgloss.JoinHorizontal(lipgloss.Top, diskSection, netSection)
-		finalLayout = lipgloss.JoinVertical(lipgloss.Left, topRow, bottom)
-	}
+			headerStyle.Render("Status"),
+			m.statusTable.View(),
+		),
+	)
+
+	bottomRow := lipgloss.JoinHorizontal(lipgloss.Top, netSection, statusSection)
+	finalLayout := lipgloss.JoinVertical(lipgloss.Left, topRow, bottomRow)
 
 	return lipgloss.NewStyle().
 		MaxWidth(m.width).
@@ -490,6 +552,13 @@ func (m model) getFocusIndicator(t focusedTable) string {
 	return ""
 }
 
-func init() {
-	rootCmd.AddCommand(dashboardCmd)
+var dashboardCmd = &cobra.Command{
+	Use:   "dash",
+	Short: "Interactive system dashboard",
+	Run: func(cmd *cobra.Command, args []string) {
+		p := tea.NewProgram(initialModel())
+		if _, err := p.Run(); err != nil {
+			fmt.Printf("Error running program: %v\n", err)
+		}
+	},
 }
