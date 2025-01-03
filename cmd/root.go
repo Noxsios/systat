@@ -10,7 +10,6 @@ import (
 var (
 	logLevel string
 	// Common flags
-	outputJSON   bool
 	rawOutput    bool
 	watchOutput  bool
 )
@@ -28,7 +27,7 @@ Features:
   - DNS queries
   - Kubernetes information
   
-All commands support JSON output (--json), raw output (--raw), and watch mode (--watch).`,
+All commands support raw output (--raw) and watch mode (--watch).`,
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
@@ -52,7 +51,6 @@ func init() {
 	rootCmd.PersistentFlags().StringVarP(&logLevel, "level", "l", "info", "log level (debug, info, warn, error)")
 	
 	// Output format flags
-	rootCmd.PersistentFlags().BoolVar(&outputJSON, "json", false, "output in JSON format instead of YAML")
-	rootCmd.PersistentFlags().BoolVar(&rawOutput, "raw", false, "output without syntax highlighting")
+	rootCmd.PersistentFlags().BoolVar(&rawOutput, "raw", false, "output without styling")
 	rootCmd.PersistentFlags().BoolVar(&watchOutput, "watch", false, "continuously watch for changes")
 }

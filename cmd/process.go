@@ -1,28 +1,25 @@
 package cmd
 
 import (
-	"encoding/json"
 	"fmt"
-	"os"
+	"sort"
 	"time"
 
-	"github.com/alecthomas/chroma/quick"
-	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/bubbles/table"
 	"github.com/charmbracelet/log"
 	"github.com/shirou/gopsutil/v3/process"
 	"github.com/spf13/cobra"
-	"gopkg.in/yaml.v3"
 )
 
 var processCmd = &cobra.Command{
 	Use:   "process",
-	Short: "Display process information and resource usage",
+	Short: "Display process information",
 	Long: `Display detailed process information using github.com/shirou/gopsutil.
 Provides information about:
-  - Running processes and their states
-  - CPU and memory usage per process
-  - Process hierarchy and relationships
-  - Open files and network connections`,
+  - Process ID and parent ID
+  - Process name and command line
+  - CPU and memory usage
+  - Creation time and running time`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		logger := log.FromContext(cmd.Context())
 
@@ -35,6 +32,7 @@ Provides information about:
 				break
 			}
 			time.Sleep(2 * time.Second)
+			fmt.Print("\033[H\033[2J") // Clear screen in watch mode
 		}
 		return nil
 	},
@@ -43,67 +41,146 @@ Provides information about:
 func showProcessInfo(logger *log.Logger) error {
 	logger.Debug("gathering process information")
 
+	if rawOutput {
+		return showRawProcessInfo()
+	}
+
 	processes, err := process.Processes()
 	if err != nil {
 		return fmt.Errorf("failed to get process list: %w", err)
 	}
 
-	var processInfos []map[string]interface{}
-	for _, p := range processes {
-		info := make(map[string]interface{})
+	// Sort processes by CPU usage
+	sort.Slice(processes, func(i, j int) bool {
+		cpu1, _ := processes[i].CPUPercent()
+		cpu2, _ := processes[j].CPUPercent()
+		return cpu1 > cpu2
+	})
 
-		if name, err := p.Name(); err == nil {
-			info["name"] = name
-		}
-		if cmdline, err := p.Cmdline(); err == nil {
-			info["cmdline"] = cmdline
-		}
-		if status, err := p.Status(); err == nil {
-			info["status"] = status
-		}
-		if createTime, err := p.CreateTime(); err == nil {
-			info["create_time"] = time.Unix(createTime/1000, 0)
-		}
-		if cpuPercent, err := p.CPUPercent(); err == nil {
-			info["cpu_percent"] = cpuPercent
-		}
-		if memInfo, err := p.MemoryInfo(); err == nil {
-			info["memory"] = memInfo
-		}
-		if username, err := p.Username(); err == nil {
-			info["username"] = username
-		}
+	fmt.Println(titleStyle.Render("Top Processes by CPU Usage"))
 
-		processInfos = append(processInfos, info)
+	columns := []table.Column{
+		{Title: "PID", Width: 8},
+		{Title: "Name", Width: 20},
+		{Title: "CPU%", Width: 8},
+		{Title: "Memory%", Width: 8},
+		{Title: "Status", Width: 10},
+		{Title: "User", Width: 12},
+		{Title: "Command", Width: 40},
 	}
 
-	var b []byte
+	var rows []table.Row
+	for _, p := range processes[:20] { // Show top 20 processes
+		pid := p.Pid
 
-	if outputJSON {
-		b, err = json.MarshalIndent(processInfos, "", "  ")
-	} else {
-		b, err = yaml.Marshal(processInfos)
+		name, err := p.Name()
+		if err != nil {
+			name = "unknown"
+		}
+
+		cpuPercent, err := p.CPUPercent()
+		if err != nil {
+			cpuPercent = 0
+		}
+
+		memPercent, err := p.MemoryPercent()
+		if err != nil {
+			memPercent = 0
+		}
+
+		status, err := p.Status()
+		if err != nil {
+			status = []string{"unknown"}
+		}
+
+		username, err := p.Username()
+		if err != nil {
+			username = "unknown"
+		}
+
+		cmdline, err := p.Cmdline()
+		if err != nil {
+			cmdline = "unknown"
+		}
+		if len(cmdline) > 40 {
+			cmdline = cmdline[:37] + "..."
+		}
+
+		rows = append(rows, table.Row{
+			fmt.Sprintf("%d", pid),
+			name,
+			fmt.Sprintf("%.1f", cpuPercent),
+			fmt.Sprintf("%.1f", memPercent),
+			status[0],
+			username,
+			cmdline,
+		})
 	}
+
+	t := NewTable(columns, rows)
+	fmt.Println(tableStyle.Render(t.View()))
+
+	return nil
+}
+
+func showRawProcessInfo() error {
+	processes, err := process.Processes()
 	if err != nil {
-		return fmt.Errorf("failed to marshal process info: %w", err)
+		return fmt.Errorf("failed to get process list: %w", err)
 	}
 
-	if rawOutput {
-		fmt.Println(string(b))
-		return nil
+	// Sort processes by CPU usage
+	sort.Slice(processes, func(i, j int) bool {
+		cpu1, _ := processes[i].CPUPercent()
+		cpu2, _ := processes[j].CPUPercent()
+		return cpu1 > cpu2
+	})
+
+	fmt.Println("Top Processes by CPU Usage:")
+	for _, p := range processes[:20] { // Show top 20 processes
+		pid := p.Pid
+
+		name, err := p.Name()
+		if err != nil {
+			name = "unknown"
+		}
+
+		cpuPercent, err := p.CPUPercent()
+		if err != nil {
+			cpuPercent = 0
+		}
+
+		memPercent, err := p.MemoryPercent()
+		if err != nil {
+			memPercent = 0
+		}
+
+		status, err := p.Status()
+		if err != nil {
+			status = []string{"unknown"}
+		}
+
+		username, err := p.Username()
+		if err != nil {
+			username = "unknown"
+		}
+
+		cmdline, err := p.Cmdline()
+		if err != nil {
+			cmdline = "unknown"
+		}
+
+		fmt.Printf("PID: %d\n", pid)
+		fmt.Printf("  Name: %s\n", name)
+		fmt.Printf("  CPU%%: %.1f\n", cpuPercent)
+		fmt.Printf("  Memory%%: %.1f\n", memPercent)
+		fmt.Printf("  Status: %s\n", status[0])
+		fmt.Printf("  User: %s\n", username)
+		fmt.Printf("  Command: %s\n", cmdline)
+		fmt.Println()
 	}
 
-	style := "catppuccin-latte"
-	if lipgloss.HasDarkBackground() {
-		style = "catppuccin-frappe"
-	}
-
-	format := "yaml"
-	if outputJSON {
-		format = "json"
-	}
-
-	return quick.Highlight(os.Stdout, string(b), format, "terminal256", style)
+	return nil
 }
 
 func init() {

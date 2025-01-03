@@ -4,7 +4,7 @@ A comprehensive system information and monitoring CLI tool.
 
 ## Features
 
-- **DNS Queries**: Query DNS information for *.admin.uds.dev and \*.uds.dev domains
+- **DNS Queries**: Query DNS information for *.admin.uds.dev and *.uds.dev domains
 - **System Information**: Detailed system hardware and OS information
 - **Network Monitoring**: Network interface and routing information (Linux only)
 - **Process Management**: List and monitor system processes
@@ -12,9 +12,9 @@ A comprehensive system information and monitoring CLI tool.
 - **System Metrics**: Real-time CPU, memory, and system metrics
 - **Kubernetes Info**: Basic Kubernetes cluster information
 - **Beautiful Output**:
-  - Colorized output using github.com/alecthomas/chroma
-  - Structured logging using github.com/charmbracelet/log
-  - JSON output support for scripting
+  - Modern terminal UI using Bubble Tea and Lip Gloss
+  - Clean tabular data presentation
+  - Structured logging
 
 ## Installation
 
@@ -56,10 +56,7 @@ systat k8s
 ### Output Options
 
 ```bash
-# Get JSON output for any command
-systat <command> --json
-
-# Raw output without formatting
+# Raw output without styling
 systat <command> --raw
 
 # Watch mode for real-time updates

@@ -3,17 +3,15 @@
 package cmd
 
 import (
-	"encoding/json"
 	"fmt"
-	"os"
+	"strconv"
+	"strings"
 	"time"
 
-	"github.com/alecthomas/chroma/quick"
-	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/bubbles/table"
 	"github.com/charmbracelet/log"
 	"github.com/spf13/cobra"
 	"github.com/vishvananda/netlink"
-	"gopkg.in/yaml.v3"
 )
 
 var networkCmd = &cobra.Command{
@@ -37,6 +35,7 @@ Provides information about:
 				break
 			}
 			time.Sleep(2 * time.Second)
+			fmt.Print("\033[H\033[2J") // Clear screen in watch mode
 		}
 		return nil
 	},
@@ -45,112 +44,175 @@ Provides information about:
 func showNetworkInfo(logger *log.Logger) error {
 	logger.Debug("gathering network information")
 
-	info := make(map[string]interface{})
-
 	// Get all network interfaces
 	links, err := netlink.LinkList()
 	if err != nil {
 		return fmt.Errorf("failed to get network interfaces: %w", err)
 	}
 
-	var interfaces []map[string]interface{}
+	if rawOutput {
+		return showRawNetworkInfo(links)
+	}
+
+	// Print interfaces table
+	fmt.Println(titleStyle.Render("Network Interfaces"))
+	
+	interfaceColumns := []table.Column{
+		{Title: "Name", Width: 10},
+		{Title: "Type", Width: 8},
+		{Title: "State", Width: 8},
+		{Title: "MAC", Width: 17},
+		{Title: "MTU", Width: 5},
+		{Title: "Addresses", Width: 40},
+	}
+
+	var interfaceRows []table.Row
 	for _, link := range links {
 		attrs := link.Attrs()
-		iface := map[string]interface{}{
-			"name":          attrs.Name,
-			"hardware_addr": attrs.HardwareAddr.String(),
-			"flags":         attrs.Flags.String(),
-			"mtu":          attrs.MTU,
-			"type":         link.Type(),
-			"state":        attrs.OperState.String(),
-			"index":        attrs.Index,
-		}
-
-		// Get IP addresses for this interface
+		
+		// Get IP addresses
 		addrs, err := netlink.AddrList(link, netlink.FAMILY_ALL)
+		addrStrs := make([]string, 0, len(addrs))
 		if err != nil {
 			logger.Warn("failed to get addresses",
 				"interface", attrs.Name,
 				"error", err)
-			iface["addresses"] = []string{"error: " + err.Error()}
+			addrStrs = append(addrStrs, "error")
 		} else {
-			addrList := make([]string, len(addrs))
-			for i, addr := range addrs {
-				addrList[i] = addr.IPNet.String()
-			}
-			iface["addresses"] = addrList
-		}
-
-		// Get interface statistics
-		stats := attrs.Statistics
-		if stats != nil {
-			iface["statistics"] = map[string]uint64{
-				"rx_packets": stats.RxPackets,
-				"tx_packets": stats.TxPackets,
-				"rx_bytes":   stats.RxBytes,
-				"tx_bytes":   stats.TxBytes,
-				"rx_errors":  stats.RxErrors,
-				"tx_errors":  stats.TxErrors,
-				"rx_dropped": stats.RxDropped,
-				"tx_dropped": stats.TxDropped,
+			for _, addr := range addrs {
+				addrStrs = append(addrStrs, addr.IPNet.String())
 			}
 		}
 
-		interfaces = append(interfaces, iface)
+		interfaceRows = append(interfaceRows, table.Row{
+			attrs.Name,
+			link.Type(),
+			attrs.OperState.String(),
+			attrs.HardwareAddr.String(),
+			fmt.Sprintf("%d", attrs.MTU),
+			strings.Join(addrStrs, ", "),
+		})
 	}
-	info["interfaces"] = interfaces
 
-	// Get routing table
+	interfaceTable := table.New(
+		table.WithColumns(interfaceColumns),
+		table.WithRows(interfaceRows),
+		table.WithHeight(len(interfaceRows)),
+		table.WithFocused(false),
+	)
+	
+	fmt.Println(tableStyle.Render(interfaceTable.View()))
+
+	// Get and print routing table
 	routes, err := netlink.RouteList(nil, netlink.FAMILY_ALL)
 	if err != nil {
 		logger.Warn("failed to get routing table", "error", err)
-	} else {
-		routeList := make([]map[string]interface{}, len(routes))
-		for i, route := range routes {
-			r := map[string]interface{}{
-				"dst":      route.Dst,
-				"src":      route.Src,
-				"gateway":  route.Gw,
-				"protocol": route.Protocol,
-				"scope":    route.Scope,
-				"table":    route.Table,
-			}
-			if route.LinkIndex > 0 {
-				if link, err := netlink.LinkByIndex(route.LinkIndex); err == nil {
-					r["interface"] = link.Attrs().Name
-				}
-			}
-			routeList[i] = r
-		}
-		info["routes"] = routeList
-	}
-
-	var b []byte
-	if outputJSON {
-		b, err = json.MarshalIndent(info, "", "  ")
-	} else {
-		b, err = yaml.Marshal(info)
-	}
-	if err != nil {
-		return fmt.Errorf("failed to marshal network info: %w", err)
-	}
-
-	if rawOutput {
-		fmt.Println(string(b))
 		return nil
 	}
 
-	style := "catppuccin-latte"
-	if lipgloss.HasDarkBackground() {
-		style = "catppuccin-frappe"
+	fmt.Println(titleStyle.Render("Routing Table"))
+
+	routeColumns := []table.Column{
+		{Title: "Destination", Width: 20},
+		{Title: "Gateway", Width: 20},
+		{Title: "Interface", Width: 10},
+		{Title: "Protocol", Width: 10},
+		{Title: "Scope", Width: 10},
 	}
 
-	format := "yaml"
-	if outputJSON {
-		format = "json"
+	var routeRows []table.Row
+	for _, route := range routes {
+		dst := "default"
+		if route.Dst != nil {
+			dst = route.Dst.String()
+		}
+
+		gw := "none"
+		if route.Gw != nil {
+			gw = route.Gw.String()
+		}
+
+		iface := "unknown"
+		if route.LinkIndex > 0 {
+			if link, err := netlink.LinkByIndex(route.LinkIndex); err == nil {
+				iface = link.Attrs().Name
+			}
+		}
+
+		routeRows = append(routeRows, table.Row{
+			dst,
+			gw,
+			iface,
+			strconv.Itoa(route.Protocol),
+			strconv.Itoa(int(route.Scope)),
+		})
 	}
 
-	return quick.Highlight(os.Stdout, string(b), format, "terminal256", style)
+	routeTable := table.New(
+		table.WithColumns(routeColumns),
+		table.WithRows(routeRows),
+		table.WithHeight(len(routeRows)),
+		table.WithFocused(false),
+	)
+
+	fmt.Println(tableStyle.Render(routeTable.View()))
+	return nil
+}
+
+func showRawNetworkInfo(links []netlink.Link) error {
+	for _, link := range links {
+		attrs := link.Attrs()
+		fmt.Printf("Interface: %s\n", attrs.Name)
+		fmt.Printf("  Type: %s\n", link.Type())
+		fmt.Printf("  State: %s\n", attrs.OperState)
+		fmt.Printf("  MAC: %s\n", attrs.HardwareAddr)
+		fmt.Printf("  MTU: %d\n", attrs.MTU)
+		
+		addrs, err := netlink.AddrList(link, netlink.FAMILY_ALL)
+		if err != nil {
+			fmt.Printf("  Addresses: error: %v\n", err)
+		} else {
+			fmt.Printf("  Addresses:\n")
+			for _, addr := range addrs {
+				fmt.Printf("    - %s\n", addr.IPNet)
+			}
+		}
+		fmt.Println()
+	}
+
+	routes, err := netlink.RouteList(nil, netlink.FAMILY_ALL)
+	if err != nil {
+		return fmt.Errorf("failed to get routing table: %w", err)
+	}
+
+	fmt.Println("Routing Table:")
+	for _, route := range routes {
+		dst := "default"
+		if route.Dst != nil {
+			dst = route.Dst.String()
+		}
+
+		gw := "none"
+		if route.Gw != nil {
+			gw = route.Gw.String()
+		}
+
+		iface := "unknown"
+		if route.LinkIndex > 0 {
+			if link, err := netlink.LinkByIndex(route.LinkIndex); err == nil {
+				iface = link.Attrs().Name
+			}
+		}
+
+		fmt.Printf("  Destination: %s\n", dst)
+		fmt.Printf("    Gateway: %s\n", gw)
+		fmt.Printf("    Interface: %s\n", iface)
+		fmt.Printf("    Protocol: %s\n", route.Protocol)
+		fmt.Printf("    Scope: %s\n", route.Scope)
+		fmt.Println()
+	}
+
+	return nil
 }
 
 func init() {
